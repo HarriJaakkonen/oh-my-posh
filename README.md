@@ -105,3 +105,133 @@ using Go (and the amazing [README](https://github.com/justjanne/powerline-go))
 [docs]: https://ohmyposh.dev
 [release-badge]: https://img.shields.io/github/v/release/jandedobbeleer/oh-my-posh?label=Release
 [release]: https://github.com/JanDeDobbeleer/oh-my-posh/releases/latest
+
+## Microsoft Security Theme
+
+![Microsoft Security Theme]
+
+A Microsoft Security–inspired theme with Azure blue highlights, Entra ID tenant info, subscription context, and admin status indicator. Perfect for security engineers and admins who live in Entra, Azure, and Git.
+
+Need the following script to $profile
+
+function Update-OMPContext {
+  param(
+    [int]$RefreshBeforeExpiryMinutes = 5
+  )
+
+  $ctxDir  = Join-Path $env:LOCALAPPDATA 'oh-my-posh'
+  $ctxPath = Join-Path $ctxDir 'context.json'
+  $old     = @{}
+
+  if (Test-Path $ctxPath) {
+    try { $old = Get-Content $ctxPath -Raw | ConvertFrom-Json -ErrorAction Stop } catch { $old = @{} }
+  }
+
+  # --- 1) Current Azure account signature (cheap) -----------------------------
+  $az = az account show --output json 2>$null | ConvertFrom-Json
+  if (-not $az) {
+    # Not signed in; publish neutral values and persist
+    $env:OMP_CLOUD_USER      = ''
+    $env:OMP_AZ_NAME         = ''
+    $env:OMP_TENANT_SHORT    = ''
+    $env:OMP_TOKEN_REMAINING = 'No Session'
+    $env:OMP_ROLE            = 'Standard User'
+    New-Item -ItemType Directory -Force -Path $ctxDir | Out-Null
+    @{ signature = ''; role = 'Standard User'; expiresOn = '' } | ConvertTo-Json | Set-Content -Path $ctxPath -Encoding UTF8
+    return
+  }
+
+  $signature = '{0}|{1}|{2}' -f $az.tenantId, $az.name, $az.user.name
+
+  # --- 2) Token remaining (only compute when needed) -------------------------
+  $token      = $null
+  $tokenLeft  = 'No Token'
+  $expiresOn  = $old.expiresOn
+
+  $needToken = $true
+  if ($old.expiresOn) {
+    try {
+      $expOld = [datetimeoffset]::Parse($old.expiresOn)
+      $needToken = ($expOld - [datetimeoffset]::UtcNow).TotalMinutes -le $RefreshBeforeExpiryMinutes
+    } catch { $needToken = $true }
+  }
+
+  if ($needToken) {
+    $token = az account get-access-token --resource https://graph.microsoft.com/ --output json 2>$null | ConvertFrom-Json
+    if ($token) {
+      $expiresOn = $token.expiresOn
+      $exp  = [datetimeoffset]::Parse($token.expiresOn)
+      $rem  = $exp - [datetimeoffset]::UtcNow
+      if ($rem.TotalMinutes -le 0) { $tokenLeft = 'Expired' }
+      elseif ($rem.TotalHours -ge 1) { $tokenLeft = '{0}h {1}m' -f [int][math]::Floor($rem.TotalHours), [int][math]::Floor($rem.TotalMinutes % 60) }
+      else { $tokenLeft = '{0}m' -f [int][math]::Ceiling($rem.TotalMinutes) }
+    }
+  } else {
+    $tokenLeft = $old.OMP_TOKEN_REMAINING
+  }
+
+  # --- 3) Role (only when signature changed or role missing) -----------------
+  $role = $old.role
+  $needRole = ([string]::IsNullOrWhiteSpace($role)) -or ($old.signature -ne $signature)
+
+  if ($needRole) {
+    try {
+      $memberOf = az rest --method GET --url https://graph.microsoft.com/v1.0/me/memberOf --output json 2>$null | ConvertFrom-Json
+      $roles = @()
+      foreach ($i in $memberOf.value) {
+        if ($i.'@odata.type' -eq '#microsoft.graph.directoryRole') { $roles += $i.displayName }
+      }
+      if (-not $roles -or $roles.Count -eq 0) { $role = 'Standard User' }
+      elseif ($roles -contains 'Global Administrator') { $role = 'Global Administrator' }
+      elseif ($roles -contains 'Security Administrator') { $role = 'Security Administrator' }
+      elseif ( ($roles -join ',') -match 'Privileged' ) { $role = 'Privileged' }
+      elseif ( ($roles -join ',') -match 'Administrator' ) { $role = 'Administrator' }
+      else { $role = 'Standard User' }
+    } catch { $role = 'Standard User' }
+  }
+
+  # --- 4) Publish env vars for the prompt (cloud-first) ----------------------
+  $env:OMP_CLOUD_USER      = ($az.user.name ?? '').Trim()
+  $env:OMP_AZ_NAME         = ($az.name ?? '').Trim()
+  $env:OMP_TENANT_ID       = $az.tenantId
+  $env:OMP_TOKEN_REMAINING = $tokenLeft
+  $env:OMP_ROLE            = $role
+
+  # --- 5) Persist small cache so next shell start is instant ------------------
+  New-Item -ItemType Directory -Force -Path $ctxDir | Out-Null
+  @{
+    signature           = $signature
+    role                = $role
+    expiresOn           = $expiresOn
+    OMP_TOKEN_REMAINING = $tokenLeft
+  } | ConvertTo-Json | Set-Content -Path $ctxPath -Encoding UTF8
+}
+
+# --- Ensure OMP context is updated before every prompt render -----------------
+if (-not ($function:prompt -match "Update-OMPContext")) {
+  $originalPrompt = $function:prompt
+  function prompt {
+    Update-OMPContext
+    & $originalPrompt
+  }
+}
+
+#    then update once per session (for initial load):
+Update-OMPContext
+
+# 3) OPTIONAL: refresh the context automatically after an 'az account set' / 'az login'
+Register-EngineEvent PowerShell.Exiting -Action { } | Out-Null  # placeholder to keep $ExecutionContext.Events alive
+$ExecutionContext.InvokeCommand.CommandNotFoundAction = {
+  param($commandName, $commandLookupEventArgs)
+  if ($commandName -eq 'az') { return }
+}
+function global:az {
+  param([Parameter(ValueFromRemainingArguments = $true)] $Args)
+  Microsoft.Azure.CLI $Args
+  if ($Args -and $Args[0] -eq 'account' -and ($Args -contains 'set' -or $Args -contains 'clear' -or $Args -contains 'login' -or $Args -contains 'logout')) {
+    Update-OMPContext
+  }
+}
+
+oh-my-posh init pwsh --config "$env:POSH_THEMES_PATH\microsoft-security.omp.json" | Invoke-Expression
+
